@@ -1,4 +1,4 @@
-use crate::controller::ws_controller;
+use crate::controller::{turn_creds_controller, ws_controller};
 use axum::routing::get;
 use axum::Router;
 use std::net::SocketAddr;
@@ -30,4 +30,5 @@ async fn main() {
 fn configure_routes() -> Router<config::state::AppState> {
     Router::new()
         .route("/v1/ws", get(ws_controller::ws_handler))
+        .route("/v1/turn-creds", get(turn_creds_controller::handler))
 }
