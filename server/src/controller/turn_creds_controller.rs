@@ -3,7 +3,21 @@
 //! The response shape mirrors the browser's `RTCIceServer[]` — the web
 //! client can spread it directly into a `new RTCPeerConnection({ iceServers })`.
 //!
-//! Two env vars drive the response:
+//! ## Auth
+//!
+//! Requires a `peer_id` query param matching an active WebSocket session
+//! (i.e. a peer that's currently registered in `AppState::tx_map`). This
+//! prevents drive-by scraping of the endpoint — only clients with a live
+//! signaling connection can mint TURN credentials.
+//!
+//! Returns:
+//! - 400 if `peer_id` is missing or not a UUID.
+//! - 403 if `peer_id` is well-formed but no active session has that ID.
+//! - 404 if neither STUN_URL nor (TURN_URL+TURN_AUTH_SECRET) is configured.
+//!
+//! ## Configuration
+//!
+//! Two env vars drive the response body:
 //!
 //! - `STUN_URL`: if set, included as a STUN-only entry (no credentials).
 //! - `TURN_URL` + `TURN_AUTH_SECRET`: if both set, included as a TURN entry
@@ -11,20 +25,25 @@
 //!   `use-auth-secret` scheme. Username is `<unix-expiry>:<arbitrary>`,
 //!   password is base64 of `HMAC-SHA1(secret, username)`. coturn validates
 //!   this against `--static-auth-secret=<same secret>`.
-//!
-//! If neither STUN_URL nor (TURN_URL+TURN_AUTH_SECRET) is set, the endpoint
-//! returns 404 and the web client falls back to its built-in defaults.
 
+use crate::config::state::AppState;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 type HmacSha1 = Hmac<Sha1>;
+
+#[derive(Deserialize)]
+pub struct TurnCredsQuery {
+    pub peer_id: String,
+}
 
 /// How long minted TURN credentials remain valid.
 const TTL_SECONDS: u64 = 3600;
@@ -49,8 +68,21 @@ pub struct TurnCredsResponse {
     pub ttl: u64,
 }
 
-/// `GET /v1/turn-creds`
-pub async fn handler() -> Result<Json<TurnCredsResponse>, StatusCode> {
+/// `GET /v1/turn-creds?peer_id=<uuid>`
+pub async fn handler(
+    State(state): State<AppState>,
+    Query(query): Query<TurnCredsQuery>,
+) -> Result<Json<TurnCredsResponse>, StatusCode> {
+    // Auth: caller must have an active WebSocket session.
+    let peer_id = Uuid::parse_str(&query.peer_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let active = {
+        let tx_map = state.tx_map.lock().await;
+        tx_map.values().any(|inner| inner.contains_key(&peer_id))
+    };
+    if !active {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let stun_url = std::env::var("STUN_URL").unwrap_or_default();
     let turn_url = std::env::var("TURN_URL").unwrap_or_default();
     let secret = std::env::var("TURN_AUTH_SECRET").unwrap_or_default();
